@@ -1,5 +1,4 @@
 import click
-import numpy as np
 import pandas as pd
 from sentistrength import PySentiStr
 from pygoogletranslation import Translator

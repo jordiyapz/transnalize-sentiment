@@ -3,7 +3,7 @@ import pandas as pd
 from sentistrength import PySentiStr
 from pygoogletranslation import Translator
 from pathlib import Path
-from utils import transnalize
+from .utils import transnalize
 
 
 @click.command()

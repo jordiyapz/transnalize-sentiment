@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='transnalize-sentiment',
-    version='0.1.0',
+    version='0.2.0',
     author='Jordi Yaputra',
     author_email='jordiyaputra@gmail.com',
     description='Batch translate and analyze sentiment strength',
@@ -17,6 +17,6 @@ setup(
     install_requires=['pandas', 'numpy',
                       'pygoogletranslation', 'sentistrength', 'tqdm', 'click'],
     entry_points={
-        'console_scripts': ['transnalize=transnalize.transnalize:cli']
+        'console_scripts': ['transnalize=transnalize.cli:cli']
     }
 )

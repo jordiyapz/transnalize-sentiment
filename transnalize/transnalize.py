@@ -25,4 +25,9 @@ def cli(file, output, batch, start, end):
         str(Path.cwd()/'lib'/'SentiStrengthCom.jar'))
     senti.setSentiStrengthLanguageFolderPath(str(Path.cwd()/'lang'))
 
+    # simple test to make sure senti works
+    test = senti.getSentiment(['You are beautiful'], 'dual')
+    assert type(test) is list
+    assert test[0][0] is 3
+
     transnalize(translator, senti, df, output.name, batch, start, end)

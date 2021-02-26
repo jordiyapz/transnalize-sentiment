@@ -9,23 +9,39 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
 from tqdm import tqdm
+import time
 
 ERR_STR = '{}: Error {}.\n'
 
 
 class Maestro:
     def __init__(self, df, output_path, output_name, batch):
+        # storing variables
         self.df = df
-        self.output_path = output_path
-        self.output_name = output_name
-        self.filename = '{}.csv'.format(
-            Path(self.output_path) / self.output_name)
+        self.filename = Path(output_path) / output_name
+        self.raw_file = '{}_raw.csv'.format(self.filename)
         self.batch = batch
 
-        # initialize translator
+        # initialize tools
         self.translator = Translator()
+        self.__initialize_senti()
 
-        # initialize senti
+        # collect jobs
+        job_list = self.__collect_jobs()
+        self.total_job = len(job_list)
+
+        # initialize queues
+        self.jobs = Queue(maxsize=self.total_job)
+        for job in job_list:
+            self.jobs.put(job)
+        self.result = Queue(maxsize=self.total_job)
+
+        # setup threading variables
+        self.stop = threading.Event()
+        self.worker_ct_lock = threading.Lock()
+        self.worker_ct = 0  # num_of_spawned worker
+
+    def __initialize_senti(self):
         self.senti = PySentiStr()
         self.senti.setSentiStrengthPath(
             str(Path.cwd()/'lib'/'SentiStrengthCom.jar'))
@@ -36,28 +52,21 @@ class Maestro:
         assert type(test) is list
         assert type(test[0]) is tuple
 
+    def __collect_jobs(self):
         try:
-            out_df = pd.read_csv(self.filename, header=None)
-            processed_ser = df['tweetid'].isin(out_df[0])
+            out_df = pd.read_csv(self.raw_file, header=None)
+            processed_ser = self.df['tweetid'].isin(out_df[1])
         except FileNotFoundError:
-            zeros = np.zeros((len(df.index),), dtype=bool)
+            zeros = np.zeros((len(self.df.index),), dtype=bool)
             processed_ser = pd.Series(zeros)
-        except Exception as e:
-            print(e)
 
         job_list = processed_ser[~processed_ser].index
-        job_list = list(grouper(job_list, batch))
-        job_list[-1] = tuple(job for job in job_list[-1] if job is not None)
-        self.total_job = len(job_list)
+        job_list = list(grouper(job_list, self.batch))
+        if len(job_list) > 0:
+            job_list[-1] = tuple(job for job in job_list[-1]
+                                 if job is not None)
 
-        # initialize job queue
-        self.jobs = Queue(maxsize=self.total_job)
-        for job in job_list:
-            self.jobs.put(job)
-
-        self.result = Queue(maxsize=self.total_job)
-
-        self.stop = threading.Event()
+        return job_list
 
     def __get_sentiment(self, series, score='dual'):
         try:
@@ -68,6 +77,7 @@ class Maestro:
                 translations = self.translator.translate(items)
         except Exception as e:
             print(ERR_STR.format('get_sentiment', 'in languange translate'), e)
+            return
 
         texts = [tr.text for tr in translations]
         langs = [tr.src for tr in translations]
@@ -78,10 +88,12 @@ class Maestro:
             print(ERR_STR.format('get_sentiment', 'in getting sentiment'), e)
             return
 
-        return [(*st, lang, '"{}"'.format(text))
+        return [(*st, lang, '"{}"'.format(text.replace('"', '\"')))
                 for st, lang, text in zip(sentis, langs, texts)]
 
     def __transnalize(self, thread_num):
+        with self.worker_ct_lock:
+            self.worker_ct = self.worker_ct + 1
         while not self.stop.is_set() and not self.jobs.empty():
             job = self.jobs.get()
             try:
@@ -90,13 +102,15 @@ class Maestro:
             except Exception as e:
                 print(ERR_STR.format('transnalize', 'slicing DataFrame'), e)
                 break
+
             try:
                 senti_batch = self.__get_sentiment(df.iloc[:, -1])
             except Exception as e:
                 print(ERR_STR.format('transnalize', 'getting sentiment'), e)
                 break
-            result = [(id, *senti)
-                      for id, senti in zip(df.iloc[:, 0], senti_batch)]
+
+            result = [(j, id, *senti)
+                      for j, id, senti in zip(job, df.iloc[:, 0], senti_batch)]
             self.result.put(result)
 
     def __save(self):
@@ -104,29 +118,61 @@ class Maestro:
         pbar = tqdm(total=total_batch, initial=(total_batch - self.total_job))
         while not self.stop.is_set() or not self.result.empty():
             if not self.result.empty():
-                with open(self.filename, 'a') as f:
-                    while not self.result.empty():
-                        result = self.result.get()
-                        for res in result:
-                            f.write(','.join(map(str, res))+'\n')
-                        pbar.update(1)
+                try:
+                    with open(self.raw_file, 'a', encoding='utf-8') as f:
+                        while not self.result.empty():
+                            results = self.result.get()
+                            for result in results:
+                                res = (*map(str, result[:-1]), result[-1])
+                                f.write(','.join(res)+'\n')
+                            pbar.update(1)
+                except Exception as e:
+                    print(ERR_STR.format('save', 'writing file'), e)
+                    break
+        print('Rebuilding...')
+        self.__rebuild()
         print('Closing...')
         pbar.close()
+
+    def __rebuild(self):
+        try:
+            sf = pd.read_csv(self.raw_file, header=None, names=[
+                             'order', 'tweetid', '+', '-', 'src_lang', 'translation'])
+            sf.sort_values('order', inplace=True)
+            sf.to_csv('{}.csv'.format(self.filename), index=None)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(ERR_STR.format('rebuild', 'on rebuilding csv'), e)
 
     def play(self, n_thread=1):
         if n_thread < 1:
             return
-        print('Spawing {} workers...'.format(n_thread))
         with ThreadPoolExecutor(max_workers=n_thread+1) as executor:
             try:
-                print('Start')
                 executor.map(self.__transnalize, range(n_thread))
+                print('Spawing {} workers...'.format(n_thread))
+                while self.worker_ct is 0:
+                    pass  # waiting for any worker being spawned
+                print('Aye, Sir!')
                 executor.submit(self.__save)
-                while True:
+
+                # as long as there are a job and atleast a worker
+                while not self.jobs.empty() and self.worker_ct > 0:
                     # wait for any keyboard interrupt
-                    pass
-            except KeyboardInterrupt:
+                    time.sleep(.5)  # power napping for half second
+                # either no job left or all worker has been despawned
                 self.stop.set()
+
+                if self.jobs.empty():
+                    print('All done!')
+                if self.worker_ct is 0:
+                    print('All workers quit their job!')
+            except KeyboardInterrupt:
                 print('\nKeyboard interrupt')
             except Exception as e:
-                print(ERR_STR.format('play', 'something went wrong'))
+                print(ERR_STR.format('play', 'something went wrong'), e)
+            finally:
+                self.stop.set()
+
+        print('Byee 👋')

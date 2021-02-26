@@ -10,6 +10,8 @@ import threading
 from pathlib import Path
 from tqdm import tqdm
 import time
+import csv
+from .exceptions import MyException
 
 ERR_STR = '{}: Error {}.\n'
 
@@ -76,20 +78,20 @@ class Maestro:
             else:
                 translations = self.translator.translate(items)
         except Exception as e:
-            print(ERR_STR.format('get_sentiment', 'in languange translate'), e)
-            return
+            raise MyException('translation-error', e)
 
         texts = [tr.text for tr in translations]
-        langs = [tr.src for tr in translations]
 
         try:
             sentis = self.senti.getSentiment(texts, score)
         except Exception as e:
-            print(ERR_STR.format('get_sentiment', 'in getting sentiment'), e)
-            return
+            raise MyException('sentiment-error', e)
 
-        return [(*st, lang, '"{}"'.format(text.replace('"', '\"')))
-                for st, lang, text in zip(sentis, langs, texts)]
+        return [(*st, tr.src, text) for st, tr, text in zip(sentis, translations, texts)]
+
+    def __despawn_worker(self):
+        with self.worker_ct_lock:
+            self.worker_ct = self.worker_ct - 1
 
     def __transnalize(self, thread_num):
         with self.worker_ct_lock:
@@ -101,12 +103,20 @@ class Maestro:
                 df = self.df.loc[job, ]
             except Exception as e:
                 print(ERR_STR.format('transnalize', 'slicing DataFrame'), e)
+                self.__despawn_worker()
                 break
 
             try:
                 senti_batch = self.__get_sentiment(df.iloc[:, -1])
+            except MyException as e:
+                print('Worker #{} got {}: {}'.format(
+                    thread_num, e.name, e.message))
+                self.__despawn_worker()
+                break
             except Exception as e:
-                print(ERR_STR.format('transnalize', 'getting sentiment'), e)
+                print('Unknown get-sentiment error!')
+                print(e)
+                self.__despawn_worker()
                 break
 
             result = [(j, id, *senti)
@@ -119,12 +129,13 @@ class Maestro:
         while not self.stop.is_set() or not self.result.empty():
             if not self.result.empty():
                 try:
-                    with open(self.raw_file, 'a', encoding='utf-8') as f:
+                    with open(self.raw_file, 'a', encoding='utf-8', newline='') as csv_file:
+                        writer = csv.writer(
+                            csv_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+
                         while not self.result.empty():
                             results = self.result.get()
-                            for result in results:
-                                res = (*map(str, result[:-1]), result[-1])
-                                f.write(','.join(res)+'\n')
+                            writer.writerows(results)
                             pbar.update(1)
                 except Exception as e:
                     print(ERR_STR.format('save', 'writing file'), e)

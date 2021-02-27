@@ -4,14 +4,13 @@ from queue import Queue
 from sentistrength import PySentiStr
 from pygoogletranslation import Translator
 from pathlib import Path
-from transnalize.itertools_recipes import grouper
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
 from tqdm import tqdm
 import time
 import csv
-from .exceptions import MyException
+from transnalize.itertools_recipes import grouper
 
 ERR_STR = '{}: Error {}.\n'
 
@@ -36,7 +35,7 @@ class Maestro:
         self.jobs = Queue(maxsize=self.total_job)
         for job in job_list:
             self.jobs.put(job)
-        self.result = Queue(maxsize=self.total_job)
+        self.results = Queue(maxsize=self.total_job)
 
         # setup threading variables
         self.stop = threading.Event()
@@ -70,79 +69,91 @@ class Maestro:
 
         return job_list
 
-    def __get_sentiment(self, series, score='dual'):
-        try:
-            items = series.to_numpy().tolist()
-            if len(series.index) == 1:
-                translations = [self.translator.translate(items)]
-            else:
-                translations = self.translator.translate(items)
-        except Exception as e:
-            raise MyException('translation-error', e)
-
-        texts = [tr.text for tr in translations]
-
-        try:
-            sentis = self.senti.getSentiment(texts, score)
-        except Exception as e:
-            raise MyException('sentiment-error', e)
-
-        return [(*st, tr.src, text) for st, tr, text in zip(sentis, translations, texts)]
-
     def __despawn_worker(self):
         with self.worker_ct_lock:
             self.worker_ct = self.worker_ct - 1
 
-    def __transnalize(self, thread_num):
+    def __translate(self, thread_num):
         with self.worker_ct_lock:
             self.worker_ct = self.worker_ct + 1
         while not self.stop.is_set() and not self.jobs.empty():
             job = self.jobs.get()
             try:
-                # trailing comma is needed coz job is array
-                df = self.df.loc[job, ]
+                mini_df = self.df.loc[job, ]  # trailing comma is needed
+                ids = mini_df.iloc[:, 0]
+                items = mini_df.iloc[:, -1].to_numpy().tolist()
             except Exception as e:
-                print(ERR_STR.format('transnalize', 'slicing DataFrame'), e)
-                self.__despawn_worker()
+                print('Worker #{} got pandas error: {}'.format(thread_num, e))
                 break
 
             try:
-                senti_batch = self.__get_sentiment(df.iloc[:, -1])
-            except MyException as e:
-                print('Worker #{} got {}: {}'.format(
-                    thread_num, e.name, e.message))
-                self.__despawn_worker()
-                break
+                if len(items) == 1:
+                    translations = [self.translator.translate(items)]
+                else:
+                    translations = self.translator.translate(items)
             except Exception as e:
-                print('Unknown get-sentiment error!')
-                print(e)
-                self.__despawn_worker()
+                print('Worker #{} got translation error: {}'.format(thread_num, e))
                 break
 
-            result = [(j, id, *senti)
-                      for j, id, senti in zip(job, df.iloc[:, 0], senti_batch)]
-            self.result.put(result)
+            self.results.put((job, ids, translations))
 
-    def __save(self):
+        self.__despawn_worker()
+
+    def __save(self, results):
+        with open(self.raw_file, 'a', encoding='utf-8', newline='') as csv_file:
+            writer = csv.writer(csv_file, delimiter=',',
+                                quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            writer.writerows(results)
+
+    def __process(self, score='dual'):
         total_batch = int(np.ceil(len(self.df.index)/self.batch))
         pbar = tqdm(total=total_batch, initial=(total_batch - self.total_job))
-        while not self.stop.is_set() or not self.result.empty():
-            if not self.result.empty():
-                try:
-                    with open(self.raw_file, 'a', encoding='utf-8', newline='') as csv_file:
-                        writer = csv.writer(
-                            csv_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
 
-                        while not self.result.empty():
-                            results = self.result.get()
-                            writer.writerows(results)
-                            pbar.update(1)
+        while not self.stop.is_set() or not self.results.empty():
+            time.sleep(2)
+            if not self.results.empty():
+                # merges all results
+                job_list, id_list, translation_list = ([], [], [])
+                steps = 0
+                while not self.results.empty():
+                    job, ids, translations = self.results.get()
+                    job_list.extend(job)
+                    id_list.extend(ids)
+                    translation_list.extend(translations)
+                    steps = steps + 1
+
+                # analyze sentiments
+                texts = [tr.text for tr in translation_list]
+                try:
+                    sentis = self.senti.getSentiment(texts, score)
                 except Exception as e:
-                    print(ERR_STR.format('save', 'writing file'), e)
+                    print('Process got sentistrength error:', e)
                     break
+
+                try:
+                    rows = [(order, i, *senti, tr.src, text)
+                            for order, i, senti, tr, text in
+                            zip(job_list, id_list, sentis, translation_list, texts)]
+                except Exception as e:
+                    print(e)
+                    break
+
+                try:
+                    self.__save(rows)
+                except Exception as e:
+                    print('Process got on save error:', e)
+                    break
+
+                pbar.update(steps)
+            time.sleep(.1)  # prevent too much loop checking
+
+        if not self.stop.is_set():
+            self.stop.set()  # force stop all threads
+
         print('Rebuilding...')
         self.__rebuild()
-        print('Closing...')
+
+        print('Exiting...')
         pbar.close()
 
     def __rebuild(self):
@@ -161,15 +172,15 @@ class Maestro:
             return
         with ThreadPoolExecutor(max_workers=n_thread+1) as executor:
             try:
-                executor.map(self.__transnalize, range(n_thread))
+                executor.map(self.__translate, range(n_thread))
                 print('Spawing {} workers...'.format(n_thread))
                 while self.worker_ct is 0:
                     pass  # waiting for any worker being spawned
                 print('Aye, Sir!')
-                executor.submit(self.__save)
+                executor.submit(self.__process)
 
-                # as long as there are a job and atleast a worker
-                while not self.jobs.empty() and self.worker_ct > 0:
+                # as long as there are atleast a worker
+                while self.worker_ct > 0:
                     # wait for any keyboard interrupt
                     time.sleep(.5)  # power napping for half second
                 # either no job left or all worker has been despawned

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='transnalize-sentiment',
-    version='1.0.0',
+    version='1.1.0',
     author='Jordi Yaputra',
     author_email='jordiyaputra@gmail.com',
     description='Batch translate and analyze sentiment strength',
